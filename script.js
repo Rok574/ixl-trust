@@ -5,6 +5,10 @@ const DEFAULT_WISP = window.SITE_CONFIG?.defaultWisp ?? "wss://anura.pro/";
 const WISP_SERVERS = window.SITE_CONFIG?.wispServers ?? [
     { name: "Anura", url: "wss://anura.pro/" },
     { name: "Fern", url: "wss://fern.best/" },
+    { name: "Mercury", url: "wss://wisp.mercurywork.shop/" },
+    { name: "Tomp", url: "wss://wisp.tomp.app/" },
+    { name: "Incognito", url: "wss://wisp.incognito.dev/" },
+    { name: "Flow Works", url: "wss://wisp.flow-works.me/" },
     { name: "Riley Wisp", url: "wss://wisp.ryzenmn.us/wisp/" },
     { name: "Alu Wisp", url: "wss://aluu.xyz/wisp/" },
 ];
