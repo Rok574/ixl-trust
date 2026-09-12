@@ -1,10 +1,10 @@
 // =====================================================
 // CONFIGURATION
 // =====================================================
-const DEFAULT_WISP = window.SITE_CONFIG?.defaultWisp ?? "wss://anura.pro/wisp/";
+const DEFAULT_WISP = window.SITE_CONFIG?.defaultWisp ?? "wss://anura.pro/";
 const WISP_SERVERS = window.SITE_CONFIG?.wispServers ?? [
     { name: "Anura", url: "wss://anura.pro/" },
-    { name: "AnuraOS Wisp", url: "wss://anura.pro/wisp/" },
+    { name: "Fern", url: "wss://fern.best/" },
     { name: "Riley Wisp", url: "wss://wisp.ryzenmn.us/wisp/" },
     { name: "Alu Wisp", url: "wss://aluu.xyz/wisp/" },
 ];
@@ -84,6 +84,11 @@ function scoreServer(url, pingLatency) {
 
 // Initialize default proxy server if not set
 if (!localStorage.getItem("proxServer")) {
+    localStorage.setItem("proxServer", DEFAULT_WISP);
+}
+// Migrate away from removed servers (e.g. AnuraOS Wisp)
+const REMOVED_WISPS = ["wss://anura.pro/wisp/"];
+if (REMOVED_WISPS.includes(localStorage.getItem("proxServer"))) {
     localStorage.setItem("proxServer", DEFAULT_WISP);
 }
 
@@ -430,14 +435,6 @@ async function initializeBrowser() {
             <div id="bookmarks-bar" class="bookmarks-bar" style="display:none"></div>
             <div class="loading-bar-container"><div class="loading-bar" id="loading-bar"></div></div>
             <div class="iframe-container" id="iframe-container">
-                <div id="loading" class="message-container" style="display: none;">
-                    <div class="message-content">
-                        <div class="spinner"></div>
-                        <h1 id="loading-title">Connecting</h1>
-                        <p id="loading-url">Initializing proxy...</p>
-                        <button id="skip-btn">Skip</button>
-                    </div>
-                </div>
                 <div id="error" class="message-container" style="display: none;">
                     <div class="message-content">
                         <h1>Connection Error</h1>
@@ -464,7 +461,6 @@ async function initializeBrowser() {
         fwdBtn: document.getElementById('fwd-btn'),
         reloadBtn: document.getElementById('reload-btn'),
         addrBar: document.getElementById('address-bar'),
-        skipBtn: document.getElementById('skip-btn')
     };
 
     // Bind navigation events
@@ -517,15 +513,6 @@ async function initializeBrowser() {
     };
     document.getElementById('devtools-btn').onclick = toggleDevTools;
     document.getElementById('wisp-settings-btn').onclick = openSettings;
-
-    // Skip button logic
-    elements.skipBtn.onclick = () => {
-        const tab = getActiveTab();
-        if (tab) {
-            tab.loading = false;
-            showIframeLoading(false);
-        }
-    };
 
     // Address bar events
     elements.addrBar.onkeyup = (e) => e.key === 'Enter' && handleSubmit();
@@ -664,8 +651,19 @@ function restoreSession() {
 }
 
 function applyTheme() {
-    const accent = getSetting("accent", "#ffffff");
+    const accent = getSetting("accent", "#3b82f6");
     document.documentElement.style.setProperty("--accent", accent);
+    // Keep the toggle knob readable on light accents (e.g. white):
+    // dark knob on light track, white knob on dark track.
+    document.documentElement.style.setProperty("--toggle-knob", isLightColor(accent) ? "#0a0a0a" : "#ffffff");
+}
+function isLightColor(hex) {
+    const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || "").trim());
+    if (!m) return false;
+    const n = parseInt(m[1], 16);
+    const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+    // Relative luminance heuristic
+    return (0.299 * r + 0.587 * g + 0.114 * b) > 150;
 }
 function applyCloak() {
     const preset = CLOAK_PRESETS[getSetting("cloak", "ixl")] || CLOAK_PRESETS.ixl;
@@ -777,13 +775,6 @@ function createTab(makeActive = true) {
         updateTabsUI();
         updateAddressBar();
         updateLoadingBar(tab, 10);
-
-        if (tab.skipTimeout) clearTimeout(tab.skipTimeout);
-        tab.skipTimeout = setTimeout(() => {
-            if (tab.loading && tab.id === activeTabId) {
-                document.getElementById('skip-btn')?.style.setProperty('display', 'inline-block');
-            }
-        }, 200);
     });
 
     frame.frame.addEventListener('load', () => {
@@ -835,18 +826,12 @@ function duplicateTab(tabId) {
     if (t && src.url && !src.url.includes("NT.html")) handleSubmit(src.url);
 }
 
+// Loading is shown via the thin top loading bar only — the fullscreen
+// "Connecting" overlay (and its iframe blur) stays hidden.
 function showIframeLoading(show, url = '') {
     const loader = document.getElementById("loading");
-    if (!loader) return;
-
-    loader.style.display = show ? "flex" : "none";
-    getActiveTab()?.frame.frame.classList.toggle('loading', show);
-
-    if (show) {
-        document.getElementById("loading-title").textContent = "Connecting";
-        document.getElementById("loading-url").textContent = url || "Loading content...";
-        document.getElementById("skip-btn").style.display = 'none';
-    }
+    if (loader) loader.style.display = "none";
+    getActiveTab()?.frame.frame.classList.remove('loading');
 }
 
 function switchTab(tabId) {
@@ -857,12 +842,6 @@ function switchTab(tabId) {
 
     if (tab) {
         showIframeLoading(tab.loading, tab.url);
-        
-        const skipBtn = document.getElementById('skip-btn');
-        if (tab.loading && tab.loadStartTime && skipBtn) {
-            const elapsed = Date.now() - tab.loadStartTime;
-            if (elapsed > 3000) skipBtn.style.display = 'inline-block';
-        }
     }
 
     updateTabsUI();
@@ -1088,7 +1067,7 @@ function renderServerList() {
     const cloak = getSetting("cloak", "ixl");
     const panicKey = getSetting("panicKey", "`");
     const panicUrl = getSetting("panicUrl", "https://classroom.google.com");
-    const accent = getSetting("accent", "#ffffff");
+    const accent = getSetting("accent", "#3b82f6");
     const restore = getSetting("restoreSession", true);
     adv.innerHTML = `
         <div class="section-title" style="margin-top:16px">Transport (advanced)</div>
@@ -1375,6 +1354,9 @@ document.addEventListener('DOMContentLoaded', async function () {
         if (errBox) {
             errBox.style.display = "flex";
             if (errMsg) errMsg.textContent = String(err?.message || err);
+        } else {
+            document.body.insertAdjacentHTML("beforeend",
+                `<div style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;color:#e4e4e7;background:#0a0a0a;z-index:99999;font-family:sans-serif"><div style="max-width:420px;text-align:center;padding:20px"><h2>Failed to start</h2><p style="color:#71717a;font-size:13px">${escapeHtml(String(err?.message || err))}</p><button onclick="location.reload()" style="margin-top:12px;padding:8px 16px;background:#1a1a1a;color:#e4e4e7;border:1px solid #2a2a2a;border-radius:6px;cursor:pointer">Retry</button></div></div>`);
         }
     }
 });

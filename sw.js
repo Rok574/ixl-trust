@@ -117,6 +117,33 @@ async function swSetTransport(connection, wispUrl) {
     throw lastErr || new Error("SW: all transports failed");
 }
 
+// BareMuxConnection only manages the transport — it has no .fetch().
+// Actual fetching goes through BareClient, which talks to the same
+// SharedWorker. (This was the "scramjet.client.fetch is not a function" bug.)
+async function ensureBareClient() {
+    if (scramjet.client && typeof scramjet.client.fetch === "function") {
+        return scramjet.client;
+    }
+    const connection = scramjet._bareConnection || new BareMux.BareMuxConnection(basePath + "bareworker.js");
+    await swSetTransport(connection, wispConfig.wispurl);
+    scramjet._bareConnection = connection;
+
+    let client = null;
+    try { client = new BareMux.BareClient(basePath + "bareworker.js"); } catch {}
+    if (!client || typeof client.fetch !== "function") {
+        try { client = new BareMux.BareClient(); } catch {}
+    }
+    if (!client || typeof client.fetch !== "function") {
+        throw new Error("BareClient unavailable (fetch missing)");
+    }
+    scramjet.client = client;
+    return client;
+}
+function resetBareClient() {
+    try { scramjet.client = null; } catch {}
+    try { scramjet._bareConnection = null; } catch {}
+}
+
 const TRACKING_PARAMS = ["utm_source","utm_medium","utm_campaign","utm_term","utm_content","fbclid","gclid","msclkid","mc_cid","mc_eid","igshid","vero_id"];
 function stripTracking(urlStr) {
     try {
@@ -216,9 +243,7 @@ function switchToServer(url, latency = null) {
     });
 
     // Reset connection to force reconnection with new server
-    if (scramjet && scramjet.client) {
-        scramjet.client = null;
-    }
+    resetBareClient();
 }
 
 // Proactively check server health and switch if needed
@@ -253,7 +278,7 @@ self.addEventListener("message", ({ data }) => {
         if (data.wispurl) {
             if (data.wispurl !== wispConfig.wispurl && scramjet) {
                 // Server changed live: drop cached client so next request reconnects.
-                try { scramjet.client = null; } catch {}
+                resetBareClient();
             }
             wispConfig.wispurl = data.wispurl;
             console.log("SW: Received wispurl", data.wispurl);
@@ -275,7 +300,7 @@ self.addEventListener("message", ({ data }) => {
         if (typeof data.adblock !== 'undefined') wispConfig.adblock = !!data.adblock;
         if (typeof data.transport !== 'undefined' && data.transport !== wispConfig.transport) {
             wispConfig.transport = data.transport;
-            try { scramjet.client = null; } catch {}
+            resetBareClient();
         }
         // Resolve config ready when we have at least wispurl
         if (wispConfig.wispurl && resolveConfigReady) {
@@ -285,7 +310,7 @@ self.addEventListener("message", ({ data }) => {
     } else if (data.type === "reconnect") {
         // Drop cached client + apply new wisp immediately.
         if (data.wispurl) wispConfig.wispurl = data.wispurl;
-        try { scramjet.client = null; } catch {}
+        resetBareClient();
         currentServerStartTime = Date.now();
         if (wispConfig.wispurl && resolveConfigReady) {
             resolveConfigReady();
@@ -326,15 +351,12 @@ scramjet.addEventListener("request", async (e) => {
             return new Response("Wisp URL not configured", { status: 500 });
         }
 
-        if (!scramjet.client) {
-            const connection = new BareMux.BareMuxConnection(basePath + "bareworker.js");
-            try {
-                await swSetTransport(connection, wispConfig.wispurl);
-            } catch (err) {
-                console.error("SW: all transports failed:", err);
-                return new Response("Proxy transport failed: " + String(err?.message || err), { status: 502 });
-            }
-            scramjet.client = connection;
+        let bare;
+        try {
+            bare = await ensureBareClient();
+        } catch (err) {
+            console.error("SW: all transports failed:", err);
+            return new Response("Proxy transport failed: " + String(err?.message || err), { status: 502 });
         }
 
         // Strip tracking params from the destination URL before fetching.
@@ -355,7 +377,7 @@ scramjet.addEventListener("request", async (e) => {
 
         for (let i = 0; i <= MAX_RETRIES; i++) {
             try {
-                const res = await scramjet.client.fetch(cleanUrl, {
+                const res = await bare.fetch(cleanUrl, {
                     method: e.method,
                     body: e.body,
                     headers: e.requestHeaders,

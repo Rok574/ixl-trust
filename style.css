@@ -16,7 +16,8 @@
     --text-dim: #52525b;
 
     /* Accent (customizable) */
-    --accent: #ffffff;
+    --accent: #3b82f6;
+    --toggle-knob: #ffffff;
     --accent-dim: rgba(255, 255, 255, 0.8);
     --accent-glow: rgba(255, 255, 255, 0.1);
 
@@ -300,8 +301,12 @@ input.bar::placeholder {
 }
 
 .iframe-container iframe.loading {
-    filter: blur(15px);
-    transition: filter 0.5s ease;
+    filter: none;
+}
+
+/* The fullscreen "Connecting" overlay is disabled (loading bar only) */
+#iframe-container #loading {
+    display: none !important;
 }
 
 .iframe-loading {
@@ -478,6 +483,36 @@ input.bar::placeholder {
     margin-bottom: 20px;
 }
 
+/* Settings modal rows injected by script.js */
+#server-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+#server-list .wisp-option {
+    width: 100%;
+}
+.settings-adv {
+    display: flex;
+    flex-direction: column;
+}
+.settings-adv .section-title {
+    margin-top: 16px;
+}
+.settings-adv .custom-input-group {
+    display: flex;
+    gap: 8px;
+}
+.settings-adv #panic-key {
+    flex: 0 0 52px;
+    min-width: 0;
+    text-align: center;
+}
+.settings-adv #panic-url {
+    flex: 1;
+    min-width: 0;
+}
+
 .wisp-option {
     display: flex;
     flex-direction: column;
@@ -623,7 +658,7 @@ input.bar::placeholder {
 .toggle-knob {
     width: 16px;
     height: 16px;
-    background: white;
+    background: var(--toggle-knob, #ffffff);
     border-radius: 50%;
     position: absolute;
     top: 2px;

@@ -46,11 +46,15 @@
     </div>
     <div id="iframe-container"></div>
     <script>
+        // Migrate away from the removed AnuraOS Wisp entry
+        if (localStorage.getItem("proxServer") === "wss://anura.pro/wisp/") {
+            localStorage.setItem("proxServer", "wss://anura.pro/");
+        }
         // Get config (same defaults as script.js; no ../config.js dependency)
-        const DEFAULT_WISP = window.SITE_CONFIG?.defaultWisp || "wss://anura.pro/wisp/";
+        const DEFAULT_WISP = window.SITE_CONFIG?.defaultWisp || "wss://anura.pro/";
         const WISP_SERVERS = window.SITE_CONFIG?.wispServers || [
             { name: "Anura", url: "wss://anura.pro/" },
-            { name: "AnuraOS Wisp", url: "wss://anura.pro/wisp/" },
+            { name: "Fern", url: "wss://fern.best/" },
             { name: "Riley Wisp", url: "wss://wisp.ryzenmn.us/wisp/" },
             { name: "Alu Wisp", url: "wss://aluu.xyz/wisp/" },
         ];
@@ -151,6 +155,7 @@
                     // Send config to service worker
                     const wispUrl = localStorage.getItem("proxServer") || DEFAULT_WISP;
                     const allServers = [...WISP_SERVERS, ...JSON.parse(localStorage.getItem('customWisps') || '[]')];
+                    const autoswitch = localStorage.getItem('wispAutoswitch') !== 'false';
                     let adblock = true, transport = "auto";
                     try { adblock = JSON.parse(localStorage.getItem("adblock") ?? "true"); } catch {}
                     try { transport = JSON.parse(localStorage.getItem("transport") ?? '"auto"'); } catch {}
