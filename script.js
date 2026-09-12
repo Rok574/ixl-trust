@@ -49,6 +49,38 @@ const CLOAK_PRESETS = {
     docs: { name: "Google Docs", title: "Google Docs", icon: "https://ssl.gstatic.com/docs/documents/images/kix-favicon-7.gif" },
     blank: { name: "Blank", title: "New Tab", icon: "" },
 };
+const THEME_PRESETS = {
+    dark: {
+        name: "Dark",
+        vars: {
+            "--bg": "#0a0a0a", "--surface": "#0f0f0f", "--surface-hover": "#1a1a1a",
+            "--surface-active": "#252525", "--border": "#1f1f1f", "--border-light": "#2a2a2a",
+            "--text": "#e4e4e7", "--text-muted": "#71717a", "--text-dim": "#52525b",
+            "--accent": "#3b82f6", "--font-sans": "'Inter', system-ui, sans-serif",
+            "--radius-md": "8px", "--radius-lg": "12px",
+        },
+    },
+    edge: {
+        name: "Edge",
+        vars: {
+            "--bg": "#eef3f8", "--surface": "#ffffff", "--surface-hover": "#e5edf6",
+            "--surface-active": "#d8e5f2", "--border": "#c8d5e2", "--border-light": "#aebfd0",
+            "--text": "#17212b", "--text-muted": "#5d6b78", "--text-dim": "#7c8a97",
+            "--accent": "#0b6bdc", "--font-sans": "'Segoe UI', system-ui, sans-serif",
+            "--radius-md": "6px", "--radius-lg": "8px",
+        },
+    },
+    chrome: {
+        name: "Chrome",
+        vars: {
+            "--bg": "#f1f3f4", "--surface": "#ffffff", "--surface-hover": "#e8eaed",
+            "--surface-active": "#dfe1e5", "--border": "#dadce0", "--border-light": "#bdc1c6",
+            "--text": "#202124", "--text-muted": "#5f6368", "--text-dim": "#80868b",
+            "--accent": "#1a73e8", "--font-sans": "'Google Sans', 'Segoe UI', system-ui, sans-serif",
+            "--radius-md": "10px", "--radius-lg": "12px",
+        },
+    },
+};
 
 // Generic settings store (all persisted in localStorage)
 const getSetting = (key, fallback) => {
@@ -187,6 +219,12 @@ async function initializeWithBestServer() {
         const serverName = allServers.find(s => s.url === best)?.name || 'Faster Server';
         notify('info', 'Auto-switched', `Using ${serverName} for best performance`);
     }
+}
+
+// Keep page navigation responsive while still repairing a bad default server
+// in the background. A full server sweep is useful on demand, not during boot.
+function initializeServerInBackground() {
+    initializeWithBestServer().catch(err => console.warn("Background server check failed:", err));
 }
 
 // =====================================================
@@ -616,17 +654,29 @@ function renderBookmarksBar() {
     bar.style.display = marks.length ? "flex" : "none";
     bar.innerHTML = "";
     marks.slice(0, 20).forEach(m => {
-        const b = document.createElement("button");
-        b.className = "bm-item";
-        b.title = m.url;
-        b.textContent = m.title || m.url;
-        b.onclick = () => handleSubmit(m.url);
-        b.oncontextmenu = (e) => {
-            e.preventDefault();
+        const item = document.createElement("div");
+        item.className = "bm-item";
+        item.title = m.url;
+
+        const open = document.createElement("button");
+        open.className = "bm-open";
+        open.textContent = m.title || m.url;
+        open.title = `Open ${m.url}`;
+        open.onclick = () => handleSubmit(m.url);
+
+        const remove = document.createElement("button");
+        remove.className = "bm-remove";
+        remove.type = "button";
+        remove.title = "Remove bookmark";
+        remove.setAttribute("aria-label", `Remove bookmark ${m.title || m.url}`);
+        remove.innerHTML = '<i class="fa-solid fa-xmark"></i>';
+        remove.onclick = (e) => {
+            e.stopPropagation();
             localStorage.setItem("bookmarks", JSON.stringify(getBookmarks().filter(x => x.url !== m.url)));
             renderBookmarksBar();
         };
-        bar.appendChild(b);
+        item.append(open, remove);
+        bar.appendChild(item);
     });
 }
 
@@ -655,8 +705,13 @@ function restoreSession() {
 }
 
 function applyTheme() {
-    const accent = getSetting("accent", "#3b82f6");
-    document.documentElement.style.setProperty("--accent", accent);
+    const themeId = getSetting("theme", "dark");
+    const theme = THEME_PRESETS[themeId] || THEME_PRESETS.dark;
+    const root = document.documentElement;
+    root.dataset.browserTheme = themeId in THEME_PRESETS ? themeId : "dark";
+    Object.entries(theme.vars).forEach(([name, value]) => root.style.setProperty(name, value));
+    const accent = getSetting("accent", theme.vars["--accent"]);
+    root.style.setProperty("--accent", accent);
     // Keep the toggle knob readable on light accents (e.g. white):
     // dark knob on light track, white knob on dark track.
     document.documentElement.style.setProperty("--toggle-knob", isLightColor(accent) ? "#0a0a0a" : "#ffffff");
@@ -792,6 +847,7 @@ function createTab(makeActive = true) {
         try {
             const title = frame.frame.contentWindow.document.title;
             if (title) tab.title = title;
+            injectProxyPageBootstrap(frame.frame.contentWindow);
         } catch { }
 
         try {
@@ -821,6 +877,29 @@ function createTab(makeActive = true) {
     if (makeActive) switchTab(tab.id);
     else { updateTabsUI(); saveSession(); }
     return tab;
+}
+
+// Scramjet owns network interception and URL rewriting. This lightweight
+// bootstrap keeps SPA history changes visible to the browser chrome and gives
+// proxied pages a stable marker without replacing their fetch/XHR machinery.
+function injectProxyPageBootstrap(win) {
+    if (!win || win === window || win.__IXL_PROXY_BOOTSTRAP__) return;
+    try {
+        win.__IXL_PROXY_BOOTSTRAP__ = true;
+        const originalPush = win.history.pushState;
+        const originalReplace = win.history.replaceState;
+        const notify = () => win.dispatchEvent(new Event("ixl-proxy-urlchange"));
+        win.history.pushState = function (...args) {
+            const result = originalPush.apply(this, args);
+            notify();
+            return result;
+        };
+        win.history.replaceState = function (...args) {
+            const result = originalReplace.apply(this, args);
+            notify();
+            return result;
+        };
+    } catch {}
 }
 
 function duplicateTab(tabId) {
@@ -1071,7 +1150,9 @@ function renderServerList() {
     const cloak = getSetting("cloak", "ixl");
     const panicKey = getSetting("panicKey", "`");
     const panicUrl = getSetting("panicUrl", "https://classroom.google.com");
-    const accent = getSetting("accent", "#3b82f6");
+    const theme = getSetting("theme", "dark");
+    const themePreset = THEME_PRESETS[theme] || THEME_PRESETS.dark;
+    const accent = getSetting("accent", themePreset.vars["--accent"]);
     const restore = getSetting("restoreSession", true);
     adv.innerHTML = `
         <div class="section-title" style="margin-top:16px">Transport (advanced)</div>
@@ -1093,6 +1174,8 @@ function renderServerList() {
         <div class="section-title" style="margin-top:16px">Panic key</div>
         <div class="custom-input-group"><input id="panic-key" maxlength="1" value="${escapeHtml(panicKey)}"><input id="panic-url" value="${escapeHtml(panicUrl)}"></div>
         <div class="settings-hint">Press the panic key to instantly jump to the panic URL. Right-click a bookmark to delete it.</div>
+        <div class="section-title" style="margin-top:16px">Browser theme</div>
+        <select id="theme-select" class="settings-select"></select>
         <div class="section-title" style="margin-top:16px">Accent</div>
         <div class="swatches" id="accent-swatches"></div>
     `;
@@ -1135,6 +1218,20 @@ function renderServerList() {
     });
     cSel.value = cloak;
     cSel.onchange = () => { setSetting("cloak", cSel.value); applyCloak(); };
+    const themeSel = adv.querySelector("#theme-select");
+    Object.entries(THEME_PRESETS).forEach(([id, preset]) => {
+        const option = document.createElement("option");
+        option.value = id;
+        option.textContent = preset.name;
+        themeSel.appendChild(option);
+    });
+    themeSel.value = theme in THEME_PRESETS ? theme : "dark";
+    themeSel.onchange = () => {
+        setSetting("theme", themeSel.value);
+        setSetting("accent", THEME_PRESETS[themeSel.value].vars["--accent"]);
+        applyTheme();
+        notify("success", "Theme updated", THEME_PRESETS[themeSel.value].name);
+    };
     adv.querySelector("#panic-key").onchange = (e) => setSetting("panicKey", e.target.value || "`");
     adv.querySelector("#panic-url").onchange = (e) => {
         let u = e.target.value.trim() || "https://classroom.google.com";
@@ -1281,9 +1378,8 @@ document.addEventListener('DOMContentLoaded', async function () {
         if (typeof $scramjetLoadController !== "function") {
             throw new Error("Scramjet CDN failed to load ($scramjetLoadController missing).");
         }
-        // Proactively find the best server before initializing
-        await initializeWithBestServer();
-        
+        // Do not make first paint wait for every configured WISP server.
+        initializeServerInBackground();
         await getSharedScramjet();
         await getSharedConnection();
 

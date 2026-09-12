@@ -78,7 +78,7 @@
 body,
 html,
 #app {
-    font-family: 'Inter', system-ui, sans-serif;
+    font-family: var(--font-sans);
     width: 100vw;
     height: 100vh;
     margin: 0;
@@ -240,6 +240,28 @@ input.bar {
 
 input.bar:focus {
     border-color: var(--border-light);
+    background: var(--surface-hover);
+}
+
+#bookmark-star {
+    position: absolute;
+    right: 4px;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    color: var(--text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+}
+
+#bookmark-star:hover {
+    color: var(--text);
     background: var(--surface-hover);
 }
 
@@ -707,19 +729,41 @@ input.bar::placeholder {
 }
 .bookmarks-bar::-webkit-scrollbar { height: 0; }
 .bm-item {
+    display: flex;
+    align-items: center;
     background: var(--surface);
     border: 1px solid var(--border);
     color: var(--text-muted);
-    font-size: 12px;
-    padding: 4px 10px;
+    padding: 0 4px 0 10px;
     border-radius: 6px;
-    cursor: pointer;
     white-space: nowrap;
     max-width: 180px;
     overflow: hidden;
-    text-overflow: ellipsis;
 }
 .bm-item:hover { color: var(--text); border-color: var(--border-light); }
+.bm-open {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 4px 4px 4px 0;
+    background: transparent;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+}
+.bm-remove {
+    flex: 0 0 auto;
+    width: 20px;
+    height: 22px;
+    padding: 0;
+    background: transparent;
+    border: none;
+    color: var(--text-dim);
+    cursor: pointer;
+}
+.bm-remove:hover { color: var(--error); }
 #bookmark-star.starred { color: #f59e0b; }
 
 /* History mini modal */

@@ -371,7 +371,7 @@ scramjet.addEventListener("request", async (e) => {
             } catch {}
         }
 
-        const MAX_RETRIES = 2;
+        const MAX_RETRIES = 1;
         let lastErr;
         const t0 = Date.now();
 
@@ -414,7 +414,7 @@ scramjet.addEventListener("request", async (e) => {
                 if (!isRetryable || i === MAX_RETRIES || e.method !== 'GET') break;
 
                 console.warn(`Scramjet retry ${i + 1}/${MAX_RETRIES} for ${e.url} due to: ${errMsg}`);
-                await new Promise(r => setTimeout(r, 500 * (i + 1)));
+                await new Promise(r => setTimeout(r, 250 * (i + 1)));
             }
         }
 
