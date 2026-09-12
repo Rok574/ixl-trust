@@ -254,8 +254,16 @@
   <script>
     const $ = s => document.querySelector(s);
     const nav = url => {
-      $('#loader').classList.add('show');
-      window.parent?.postMessage({ type: 'navigate', url }, '*');
+      // When framed inside the proxy browser, ask the parent to navigate the
+      // active Scramjet tab. When opened standalone, navigate directly.
+      try {
+        if (window.parent && window.parent !== window) {
+          $('#loader').classList.add('show');
+          window.parent.postMessage({ type: 'navigate', url }, '*');
+          return;
+        }
+      } catch {}
+      window.location.href = url;
     };
 
     // Clock
@@ -279,6 +287,17 @@ updateClock();
 setInterval(updateClock, 1000);
 
     // Search
+    const ENGINES = {
+      brave: "https://search.brave.com/search?q=",
+      duckduckgo: "https://duckduckgo.com/?q=",
+      google: "https://www.google.com/search?q=",
+      bing: "https://www.bing.com/search?q=",
+      qwant: "https://www.qwant.com/?q=",
+    };
+    try {
+      const saved = JSON.parse(localStorage.getItem("searchEngine") || '"brave"');
+      if (ENGINES[saved]) $('#engine').value = ENGINES[saved];
+    } catch {}
     $('#searchForm').onsubmit = e => {
       e.preventDefault();
       const q = $('#searchInput').value.trim();
@@ -316,10 +335,14 @@ setInterval(updateClock, 1000);
         const div = document.createElement('div');
         div.className = 'shortcut custom-shortcut';
         div.dataset.url = s.url;
-        div.innerHTML = `
-          <div class="shortcut-icon"><i class="fa-solid fa-link"></i></div>
-          <span class="shortcut-label">${s.name}</span>
-        `;
+        const icon = document.createElement('div');
+        icon.className = 'shortcut-icon';
+        icon.innerHTML = '<i class="fa-solid fa-link"></i>';
+        const label = document.createElement('span');
+        label.className = 'shortcut-label';
+        label.textContent = s.name;
+        div.appendChild(icon);
+        div.appendChild(label);
         addBtn.before(div);
       });
     }

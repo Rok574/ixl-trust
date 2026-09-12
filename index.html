@@ -14,14 +14,17 @@
         <!-- Ixl worker -->
         <script src="https://cdn.jsdelivr.net/gh/Destroyed12121/Staticsj@main/JS/scramjet.all.js"></script>
 
-        <!-- Helper -->
+        <!-- Helper: load BareMux ESM and expose globally BEFORE script.js runs.
+             script.js waits for window.BareMuxReady, so no race. -->
         <script type="module">
           import * as BareMux from "https://cdn.jsdelivr.net/npm/@mercuryworkshop/bare-mux/dist/index.mjs";
           window.BareMux = BareMux;
+          window.BareMuxReady = Promise.resolve(BareMux);
+          window.dispatchEvent(new Event("baremux-ready"));
         </script>
 
         <link rel="stylesheet" href="style.css" />
-        <script src="./script.js"></script>
+        <script src="./script.js" defer></script>
 
         <style>
           body {
@@ -35,25 +38,25 @@
         <div id="app"></div>
 
         <div class="wisp-settings-modal hidden" id="wisp-settings-modal">
-          <div class="settings-card">
+          <div class="settings-card" style="width:440px">
             <div class="settings-header">
-              <h2>Proxy Settings</h2>
+              <h2>Settings</h2>
               <button id="close-wisp-modal">X</button>
             </div>
 
-            <div class="settings-content">
-              <div>Select Server</div>
+            <div class="settings-content" style="max-height:70vh">
+              <div class="section-title">Proxy server</div>
               <div id="server-list"></div>
 
-              <div>Custom Server</div>
-              <div>
+              <div class="section-title" style="margin-top:16px">Custom server</div>
+              <div class="custom-input-group">
                 <input type="text" id="custom-wisp-input" placeholder="wss://your-wisp-server.com/wisp/" />
                 <button id="save-custom-wisp">+</button>
               </div>
             </div>
 
             <div class="settings-footer">
-              Lower ping = faster browsing
+              Lower ping = faster browsing · double-click a tab to duplicate · Ctrl+T / Ctrl+L shortcuts
             </div>
           </div>
         </div>

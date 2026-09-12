@@ -1,8 +1,86 @@
 // =====================================================
-// CONFIGURATION - Gets from config.js
+// CONFIGURATION
 // =====================================================
 const DEFAULT_WISP = window.SITE_CONFIG?.defaultWisp ?? "wss://anura.pro/wisp/";
-const WISP_SERVERS = [{ name: "AnuraOS Wisp", url: "wss://anura.pro/wisp/" }];
+const WISP_SERVERS = window.SITE_CONFIG?.wispServers ?? [
+    { name: "Anura", url: "wss://anura.pro/" },
+    { name: "AnuraOS Wisp", url: "wss://anura.pro/wisp/" },
+    { name: "Riley Wisp", url: "wss://wisp.ryzenmn.us/wisp/" },
+    { name: "Alu Wisp", url: "wss://aluu.xyz/wisp/" },
+];
+
+// Transport fallback chain. Epoxy (fast TLS) first, libcurl second — both
+// speak WISP, but different TLS stacks succeed on different sites/networks.
+// Each entry: { id, url, args(wispUrl) }.
+const TRANSPORTS = [
+    {
+        id: "epoxy-jsdelivr",
+        url: "https://cdn.jsdelivr.net/npm/@mercuryworkshop/epoxy-transport@2.1.28/dist/index.mjs",
+        args: (wisp) => [{ wisp }],
+    },
+    {
+        id: "epoxy-unpkg",
+        url: "https://unpkg.com/@mercuryworkshop/epoxy-transport@2.1.28/dist/index.mjs",
+        args: (wisp) => [{ wisp }],
+    },
+    {
+        id: "libcurl",
+        url: "https://cdn.jsdelivr.net/npm/@mercuryworkshop/libcurl-transport@1.5.0/dist/index.mjs",
+        args: (wisp) => [{ websocket: wisp }],
+    },
+];
+
+const SEARCH_ENGINES = {
+    brave: { name: "Brave", url: "https://search.brave.com/search?q=" },
+    duckduckgo: { name: "DuckDuckGo", url: "https://duckduckgo.com/?q=" },
+    google: { name: "Google", url: "https://www.google.com/search?q=" },
+    bing: { name: "Bing", url: "https://www.bing.com/search?q=" },
+    qwant: { name: "Qwant", url: "https://www.qwant.com/?q=" },
+};
+
+const CLOAK_PRESETS = {
+    ixl: { name: "IXL", title: "IXL | Math, Language Arts, Science, Social Studies, and Spanish", icon: "https://ixl.com/ixl-favicon.png" },
+    classroom: { name: "Google Classroom", title: "Home", icon: "https://ssl.gstatic.com/classroom/favicon.png" },
+    drive: { name: "Google Drive", title: "My Drive - Google Drive", icon: "https://ssl.gstatic.com/images/branding/product/1x/drive_2020q4_32dp.png" },
+    docs: { name: "Google Docs", title: "Google Docs", icon: "https://ssl.gstatic.com/docs/documents/images/kix-favicon-7.gif" },
+    blank: { name: "Blank", title: "New Tab", icon: "" },
+};
+
+// Generic settings store (all persisted in localStorage)
+const getSetting = (key, fallback) => {
+    try {
+        const v = localStorage.getItem(key);
+        return v === null ? fallback : JSON.parse(v);
+    } catch { return fallback; }
+};
+const setSetting = (key, value) => {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
+};
+const getSearchEngine = () => SEARCH_ENGINES[getSetting("searchEngine", "brave")] ?? SEARCH_ENGINES.brave;
+
+// Per-server real-traffic stats: { emaMs, ok, fail, lastOk }
+// Used for latency-aware routing on top of raw WebSocket pings.
+const transportStats = new Map();
+function recordFetchResult(wispUrl, ok, latencyMs) {
+    let s = transportStats.get(wispUrl);
+    if (!s) { s = { emaMs: null, ok: 0, fail: 0, lastOk: 0 }; transportStats.set(wispUrl, s); }
+    if (ok) {
+        s.ok++;
+        s.lastOk = Date.now();
+        s.emaMs = s.emaMs === null ? latencyMs : s.emaMs * 0.7 + latencyMs * 0.3;
+    } else {
+        s.fail++;
+    }
+}
+function scoreServer(url, pingLatency) {
+    const s = transportStats.get(url);
+    const fails = s?.fail ?? 0;
+    const oks = s?.ok ?? 0;
+    // Heavy penalty for failing servers, mild preference for proven-fast ones.
+    const base = pingLatency ?? 1500;
+    const ema = s?.emaMs ?? base;
+    return ema * 0.6 + base * 0.4 + fails * 750 - Math.min(oks * 5, 200);
+}
 
 // Initialize default proxy server if not set
 if (!localStorage.getItem("proxServer")) {
@@ -48,19 +126,20 @@ async function pingWispServer(url, timeout = 2000) {
     });
 }
 
-// Find the best (fastest working) server from the list
+// Find the best (fastest working) server from the list.
+// Combines live WebSocket pings with real fetch-traffic stats.
 async function findBestWispServer(servers, currentUrl) {
     if (!servers || servers.length === 0) return currentUrl;
 
-    // Ping all servers in parallel (faster than sequential)
+    const preferred = getSetting("transport", "auto");
+    // When user pinned a transport, still pick best server via ping.
     const results = await Promise.all(
         servers.map(s => pingWispServer(s.url, 2000))
     );
 
-    // Filter to only working servers and sort by latency
     const working = results
         .filter(r => r.success)
-        .sort((a, b) => a.latency - b.latency);
+        .sort((a, b) => scoreServer(a.url, a.latency) - scoreServer(b.url, b.latency));
 
     if (working.length > 0) {
         return working[0].url;
@@ -104,12 +183,57 @@ async function initializeWithBestServer() {
 // =====================================================
 // BROWSER STATE
 // =====================================================
-const BareMux = window.BareMux ?? { BareMuxConnection: class { setTransport() {} } };
+// Wait for the BareMux ESM module (loaded in index.html) instead of
+// falling back to a dummy that silently breaks all proxying.
+function getBareMux() {
+    if (window.BareMux?.BareMuxConnection) return Promise.resolve(window.BareMux);
+    if (window.BareMuxReady) return window.BareMuxReady.then(() => window.BareMux);
+    return new Promise((resolve) => {
+        let done = false;
+        const finish = () => {
+            if (done) return;
+            done = true;
+            resolve(window.BareMux);
+        };
+        window.addEventListener("baremux-ready", finish, { once: true });
+        // Poll as a fallback in case the event fired before we listened.
+        const iv = setInterval(() => {
+            if (window.BareMux?.BareMuxConnection) {
+                clearInterval(iv);
+                finish();
+            }
+        }, 50);
+        // Give up after 10s — caller will throw a clear error.
+        setTimeout(() => { clearInterval(iv); finish(); }, 10000);
+    });
+}
 
 // SINGLETON: Shared resources for all tabs (prevents connection exhaustion)
 let sharedScramjet = null;
 let sharedConnection = null;
 let sharedConnectionReady = false;
+let activeTransportId = null;
+
+// Try each transport in order until one accepts setTransport().
+async function setTransportWithFallback(connection, wispUrl) {
+    const preferred = getSetting("transport", "auto");
+    const ordered = preferred === "auto"
+        ? TRANSPORTS
+        : [...TRANSPORTS.filter(t => t.id === preferred), ...TRANSPORTS.filter(t => t.id !== preferred)];
+    let lastErr = null;
+    for (const t of ordered) {
+        try {
+            await connection.setTransport(t.url, t.args(wispUrl));
+            activeTransportId = t.id;
+            console.log(`Transport ready: ${t.id} via ${wispUrl}`);
+            return t.id;
+        } catch (err) {
+            lastErr = err;
+            console.warn(`Transport ${t.id} failed, trying next:`, err?.message || err);
+        }
+    }
+    throw lastErr || new Error("All transports failed.");
+}
 
 let tabs = [];
 let activeTabId = null;
@@ -130,11 +254,48 @@ const getStoredWisps = () => {
 
 const getActiveTab = () => tabs.find(t => t.id === activeTabId);
 
-const notify = (type, title, message) => {
-    if (typeof Notify !== 'undefined') {
-        Notify[type](title, message);
+// Toast notifications (replaces missing Notify dependency)
+function ensureToastContainer() {
+    let c = document.getElementById("toast-container");
+    if (!c) {
+        c = document.createElement("div");
+        c.id = "toast-container";
+        document.body.appendChild(c);
     }
+    return c;
+}
+const notify = (type, title, message) => {
+    try {
+        if (typeof Notify !== "undefined" && Notify[type]) { Notify[type](title, message); return; }
+        const c = ensureToastContainer();
+        const el = document.createElement("div");
+        el.className = `toast toast-${type || "info"}`;
+        el.innerHTML = `<div class="toast-title"></div><div class="toast-msg"></div>`;
+        el.querySelector(".toast-title").textContent = title || "";
+        el.querySelector(".toast-msg").textContent = message || "";
+        c.appendChild(el);
+        setTimeout(() => el.classList.add("show"), 10);
+        setTimeout(() => { el.classList.remove("show"); setTimeout(() => el.remove(), 300); }, 3600);
+        while (c.children.length > 4) c.firstChild.remove();
+    } catch {}
 };
+
+// Connection status pill in the nav bar
+function updateConnectionStatus(state, latencyMs) {
+    const pill = document.getElementById("conn-status");
+    if (!pill) return;
+    const dot = pill.querySelector(".conn-dot");
+    const txt = pill.querySelector(".conn-text");
+    pill.dataset.state = state;
+    if (dot) dot.className = `conn-dot conn-${state}`;
+    if (txt) {
+        const transport = activeTransportId ? ` · ${activeTransportId.split("-")[0]}` : "";
+        txt.textContent = state === "online"
+            ? (latencyMs != null ? `${latencyMs}ms${transport}` : `online${transport}`)
+            : state === "switching" ? "switching…" : "offline";
+    }
+    pill.title = `Proxy: ${localStorage.getItem("proxServer") || DEFAULT_WISP}${activeTransportId ? ` (${activeTransportId})` : ""}`;
+}
 
 // =====================================================
 // INITIALIZATION
@@ -142,6 +303,9 @@ const notify = (type, title, message) => {
 async function getSharedScramjet() {
     if (sharedScramjet) return sharedScramjet;
 
+    if (typeof $scramjetLoadController !== "function") {
+        throw new Error("Scramjet CDN failed to load ($scramjetLoadController missing).");
+    }
     const basePath = getBasePath();
     const { ScramjetController } = $scramjetLoadController();
     
@@ -151,14 +315,34 @@ async function getSharedScramjet() {
             wasm: "https://cdn.jsdelivr.net/gh/Destroyed12121/Staticsj@main/JS/scramjet.wasm.wasm",
             all: "https://cdn.jsdelivr.net/gh/Destroyed12121/Staticsj@main/JS/scramjet.all.js",
             sync: "https://cdn.jsdelivr.net/gh/Destroyed12121/Staticsj@main/JS/scramjet.sync.js"
-        }
+        },
+        // Compatibility flags: keep rewrites lenient so heavy apps
+        // (Discord, YouTube, Spotify) don't hard-crash on edge JS.
+        flags: {
+            strictRewrites: false,
+            captureErrors: true,
+            cleanErrors: true,
+            allowInvalidJs: true,
+            allowFailedIntercepts: true,
+            interceptDownloads: true,
+            syncxhr: false,
+            serviceworkers: true,
+            sourcemaps: false,
+        },
+        siteFlags: {
+            "discord\\.com": { syncxhr: true, serviceworkers: false },
+            "youtube\\.com": { sourcemaps: false, serviceworkers: false },
+            "spotify\\.com": { serviceworkers: false },
+            "netflix\\.com": { serviceworkers: false },
+        },
     });
     
     try {
         await sharedScramjet.init();
     } catch (err) {
         // Handle IndexedDB schema errors by clearing cache and retrying
-        if (err.message && err.message.includes('IDBDatabase') || err.message && err.message.includes('object stores')) {
+        const msg = String(err?.message || "");
+        if (msg.includes('IDBDatabase') || msg.includes('object stores')) {
             console.warn('Scramjet IndexedDB error, clearing cache and retrying...');
             
             // Clear IndexedDB for Scramjet
@@ -186,34 +370,64 @@ async function getSharedScramjet() {
 async function getSharedConnection() {
     if (sharedConnectionReady) return sharedConnection;
 
+    const BareMux = await getBareMux();
+    if (!BareMux?.BareMuxConnection) {
+        throw new Error("BareMux failed to load. Check network / CDN access.");
+    }
+
     const basePath = getBasePath();
     const wispUrl = localStorage.getItem("proxServer") ?? DEFAULT_WISP;
     
     sharedConnection = new BareMux.BareMuxConnection(basePath + "bareworker.js");
-    await sharedConnection.setTransport(
-        "https://cdn.jsdelivr.net/npm/@mercuryworkshop/epoxy-transport@2.1.28/dist/index.mjs",
-        [{ wisp: wispUrl }]
-    );
+    await setTransportWithFallback(sharedConnection, wispUrl);
     sharedConnectionReady = true;
+    updateConnectionStatus("online", null);
     return sharedConnection;
 }
 
+// Live reconnect to a different WISP without a full page reload.
+// Falls back to reload if the live swap fails.
+async function reconnectTransport(newWispUrl) {
+    const wispUrl = newWispUrl || localStorage.getItem("proxServer") || DEFAULT_WISP;
+    try {
+        if (sharedConnection) {
+            await setTransportWithFallback(sharedConnection, wispUrl);
+        }
+        navigator.serviceWorker.controller?.postMessage({ type: "config", wispurl: wispUrl });
+        // Also tell the SW to drop its cached Bare client so it reconnects.
+        navigator.serviceWorker.controller?.postMessage({ type: "reconnect", wispurl: wispUrl });
+        updateConnectionStatus("online", null);
+        return true;
+    } catch (err) {
+        console.warn("Live reconnect failed, will reload:", err);
+        return false;
+    }
+}
+
 async function initializeBrowser() {
+    applyTheme();
+    applyCloak();
     const root = document.getElementById("app");
+    if (!root) throw new Error("#app container missing.");
     root.innerHTML = `
         <div class="browser-container">
             <div class="flex tabs" id="tabs-container"></div>
             <div class="flex nav">
-                <button id="back-btn" title="Back"><i class="fa-solid fa-chevron-left"></i></button>
-                <button id="fwd-btn" title="Forward"><i class="fa-solid fa-chevron-right"></i></button>
-                <button id="reload-btn" title="Reload"><i class="fa-solid fa-rotate-right"></i></button>
+                <button id="back-btn" title="Back (Alt+Left)"><i class="fa-solid fa-chevron-left"></i></button>
+                <button id="fwd-btn" title="Forward (Alt+Right)"><i class="fa-solid fa-chevron-right"></i></button>
+                <button id="reload-btn" title="Reload (Ctrl+R)"><i class="fa-solid fa-rotate-right"></i></button>
+                <button id="home-btn-top" title="New Tab home"><i class="fa-solid fa-house"></i></button>
                 <div class="address-wrapper">
                     <input class="bar" id="address-bar" autocomplete="off" placeholder="Search or enter URL">
-                    <button id="home-btn-nav" title="Home"><i class="fa-solid fa-house"></i></button>
+                    <button id="bookmark-star" title="Bookmark this page"><i class="fa-regular fa-star"></i></button>
                 </div>
+                <div id="conn-status" class="conn-pill" data-state="switching" title="Proxy status"><span class="conn-dot conn-switching"></span><span class="conn-text">…</span></div>
+                <button id="history-btn" title="History"><i class="fa-solid fa-clock-rotate-left"></i></button>
+                <button id="cloak-btn" title="Open cloaked (about:blank)"><i class="fa-solid fa-eye-low-vision"></i></button>
                 <button id="devtools-btn" title="DevTools"><i class="fa-solid fa-code"></i></button>
-                <button id="wisp-settings-btn" title="Proxy Settings"><i class="fa-solid fa-gear"></i></button>
+                <button id="wisp-settings-btn" title="Settings"><i class="fa-solid fa-gear"></i></button>
             </div>
+            <div id="bookmarks-bar" class="bookmarks-bar" style="display:none"></div>
             <div class="loading-bar-container"><div class="loading-bar" id="loading-bar"></div></div>
             <div class="iframe-container" id="iframe-container">
                 <div id="loading" class="message-container" style="display: none;">
@@ -228,7 +442,18 @@ async function initializeBrowser() {
                     <div class="message-content">
                         <h1>Connection Error</h1>
                         <p id="error-message">An error occurred.</p>
+                        <div class="error-actions">
+                            <button id="retry-btn">Retry</button>
+                            <button id="switch-server-btn">Try another server</button>
+                        </div>
                     </div>
+                </div>
+            </div>
+            <div id="history-modal" class="mini-modal hidden">
+                <div class="mini-card">
+                    <div class="mini-header"><span>History</span><div><button id="clear-history">Clear</button><button id="close-history">✕</button></div></div>
+                    <input id="history-search" placeholder="Search history…">
+                    <div id="history-list"></div>
                 </div>
             </div>
         </div>`;
@@ -246,7 +471,50 @@ async function initializeBrowser() {
     elements.backBtn.onclick = () => getActiveTab()?.frame.back();
     elements.fwdBtn.onclick = () => getActiveTab()?.frame.forward();
     elements.reloadBtn.onclick = () => getActiveTab()?.frame.reload();
-    document.getElementById('home-btn-nav').onclick = () => window.location.href = '../index.html';
+    const goHome = () => {
+        const tab = getActiveTab();
+        if (!tab) return;
+        tab.loading = true;
+        showIframeLoading(true, "New Tab");
+        showErrorBox(false);
+        try { tab.frame.go("about:blank"); } catch {}
+        tab.url = "NT.html";
+        tab.title = "New Tab";
+        tab.favicon = null;
+        tab.loading = false;
+        showIframeLoading(false);
+        // Reset the frame to the local new-tab page (not proxied).
+        tab.frame.frame.src = getBasePath() + "NT.html";
+        updateTabsUI();
+        updateAddressBar();
+        saveSession();
+    };
+    document.getElementById('home-btn-top').onclick = goHome;
+    document.getElementById('bookmark-star').onclick = () => toggleBookmarkCurrent();
+    document.getElementById('history-btn').onclick = openHistory;
+    document.getElementById('cloak-btn').onclick = openCloaked;
+    document.getElementById('conn-status').onclick = async () => {
+        // Click status pill = fastest-server re-check + live reconnect.
+        updateConnectionStatus("switching", null);
+        const best = await findBestWispServer(getAllWispServers(), localStorage.getItem("proxServer"));
+        if (best) {
+            localStorage.setItem("proxServer", best);
+            await reconnectTransport(best);
+            syncSwConfig();
+        }
+        const st = transportStats.get(localStorage.getItem("proxServer"));
+        updateConnectionStatus("online", st?.emaMs != null ? Math.round(st.emaMs) : null);
+    };
+    document.getElementById('close-history').onclick = () => document.getElementById('history-modal').classList.add('hidden');
+    document.getElementById('clear-history').onclick = () => { localStorage.removeItem('proxyHistory'); renderHistory(""); };
+    document.getElementById('history-search').oninput = (e) => renderHistory(e.target.value);
+    document.getElementById('retry-btn').onclick = () => { const t = getActiveTab(); if (t && t.url) handleSubmit(t.url); };
+    document.getElementById('switch-server-btn').onclick = async () => {
+        showErrorBox(false);
+        const best = await findBestWispServer(getAllWispServers(), localStorage.getItem("proxServer"));
+        if (best) { localStorage.setItem("proxServer", best); await reconnectTransport(best); syncSwConfig(); }
+        const t = getActiveTab(); if (t && t.url) handleSubmit(t.url);
+    };
     document.getElementById('devtools-btn').onclick = toggleDevTools;
     document.getElementById('wisp-settings-btn').onclick = openSettings;
 
@@ -268,14 +536,212 @@ async function initializeBrowser() {
         if (e.data?.type === 'navigate') handleSubmit(e.data.url);
     });
 
-    createTab(true);
+    bindGlobalShortcuts();
+    bindPanicKey();
+    renderBookmarksBar();
+
+    // Session restore: reopen last session's tabs, else fresh tab.
+    const restored = restoreSession();
+    if (!restored) createTab(true);
     checkHashParameters();
+    updateConnectionStatus("online", null);
+}
+
+// =====================================================
+// HISTORY / BOOKMARKS / SESSION / CLOAK / THEME
+// =====================================================
+function showErrorBox(show, msg) {
+    const box = document.getElementById("error");
+    if (!box) return;
+    box.style.display = show ? "flex" : "none";
+    if (show && msg) {
+        const m = document.getElementById("error-message");
+        if (m) m.textContent = msg;
+    }
+    if (show) showIframeLoading(false);
+}
+
+function recordHistory(url, title) {
+    try {
+        if (!url || url.includes("NT.html") || url === "about:blank") return;
+        const h = JSON.parse(localStorage.getItem("proxyHistory") || "[]");
+        h.unshift({ url, title: title || url, t: Date.now() });
+        localStorage.setItem("proxyHistory", JSON.stringify(h.slice(0, 300)));
+    } catch {}
+}
+function openHistory() {
+    document.getElementById('history-modal').classList.remove('hidden');
+    const s = document.getElementById('history-search');
+    if (s) s.value = "";
+    renderHistory("");
+}
+function renderHistory(filter) {
+    const list = document.getElementById("history-list");
+    if (!list) return;
+    const q = (filter || "").toLowerCase();
+    let h = [];
+    try { h = JSON.parse(localStorage.getItem("proxyHistory") || "[]"); } catch {}
+    list.innerHTML = "";
+    h.filter(e => !q || e.url.toLowerCase().includes(q) || (e.title || "").toLowerCase().includes(q))
+     .slice(0, 80).forEach(e => {
+        const row = document.createElement("div");
+        row.className = "hist-row";
+        const b = document.createElement("button");
+        b.className = "hist-go";
+        b.textContent = e.title || e.url;
+        b.title = e.url;
+        b.onclick = () => { document.getElementById('history-modal').classList.add('hidden'); handleSubmit(e.url); };
+        const del = document.createElement("button");
+        del.className = "hist-del";
+        del.textContent = "✕";
+        del.onclick = () => {
+            const all = JSON.parse(localStorage.getItem("proxyHistory") || "[]").filter(x => x.url !== e.url || x.t !== e.t);
+            localStorage.setItem("proxyHistory", JSON.stringify(all));
+            renderHistory(document.getElementById('history-search')?.value || "");
+        };
+        row.appendChild(b); row.appendChild(del);
+        list.appendChild(row);
+    });
+    if (!list.children.length) list.innerHTML = `<div class="hist-empty">No history yet.</div>`;
+}
+
+function getBookmarks() {
+    try { return JSON.parse(localStorage.getItem("bookmarks") || "[]"); } catch { return []; }
+}
+function toggleBookmarkCurrent() {
+    const tab = getActiveTab();
+    if (!tab || !tab.url || tab.url.includes("NT.html")) { notify("warning", "Nothing to bookmark", "Navigate somewhere first."); return; }
+    const marks = getBookmarks();
+    const i = marks.findIndex(m => m.url === tab.url);
+    if (i >= 0) { marks.splice(i, 1); notify("info", "Bookmark removed", tab.title); }
+    else { marks.unshift({ url: tab.url, title: tab.title || tab.url }); notify("success", "Bookmarked", tab.title); }
+    localStorage.setItem("bookmarks", JSON.stringify(marks.slice(0, 100)));
+    renderBookmarksBar(); updateAddressBar();
+}
+function renderBookmarksBar() {
+    const bar = document.getElementById("bookmarks-bar");
+    if (!bar) return;
+    const marks = getBookmarks();
+    bar.style.display = marks.length ? "flex" : "none";
+    bar.innerHTML = "";
+    marks.slice(0, 20).forEach(m => {
+        const b = document.createElement("button");
+        b.className = "bm-item";
+        b.title = m.url;
+        b.textContent = m.title || m.url;
+        b.onclick = () => handleSubmit(m.url);
+        b.oncontextmenu = (e) => {
+            e.preventDefault();
+            localStorage.setItem("bookmarks", JSON.stringify(getBookmarks().filter(x => x.url !== m.url)));
+            renderBookmarksBar();
+        };
+        bar.appendChild(b);
+    });
+}
+
+let sessionTimer = null;
+function saveSession() {
+    clearTimeout(sessionTimer);
+    sessionTimer = setTimeout(() => {
+        try {
+            const urls = tabs.map(t => t.url).filter(u => u && !u.includes("NT.html") && u !== "about:blank").slice(0, 10);
+            localStorage.setItem("proxySession", JSON.stringify({ urls, active: getActiveTab()?.url || null }));
+        } catch {}
+    }, 500);
+}
+function restoreSession() {
+    try {
+        if (!getSetting("restoreSession", true)) return false;
+        const s = JSON.parse(localStorage.getItem("proxySession") || "null");
+        if (!s || !s.urls || !s.urls.length) return false;
+        s.urls.forEach((u, i) => {
+            const t = createTab(i === 0);
+            if (t && i > 0) { /* navigate after creation */ setTimeout(() => { const tab = tabs.find(x => x.id === t.id); if (tab) { switchTab(t.id); handleSubmit(u); } }, 300 * i); }
+            else if (t) handleSubmit(u);
+        });
+        return true;
+    } catch { return false; }
+}
+
+function applyTheme() {
+    const accent = getSetting("accent", "#ffffff");
+    document.documentElement.style.setProperty("--accent", accent);
+}
+function applyCloak() {
+    const preset = CLOAK_PRESETS[getSetting("cloak", "ixl")] || CLOAK_PRESETS.ixl;
+    const customTitle = getSetting("cloakTitle", null);
+    const customIcon = getSetting("cloakIcon", null);
+    document.title = customTitle || preset.title;
+    let link = document.querySelector("link[rel='icon']");
+    const icon = customIcon || preset.icon;
+    if (icon) {
+        if (!link) { link = document.createElement("link"); link.rel = "icon"; document.head.appendChild(link); }
+        link.href = icon;
+    }
+}
+function openCloaked() {
+    // Classic about:blank cloak: opens a blank page embedding this browser.
+    const w = window.open("about:blank", "_blank");
+    if (!w) { notify("warning", "Popup blocked", "Allow popups to use cloaked window."); return; }
+    w.document.write(`<html><head><title>${escapeHtml(document.title)}</title></head><body style="margin:0"><iframe src="${escapeHtml(location.href)}" style="width:100vw;height:100vh;border:none"></iframe></body></html>`);
+    w.document.close();
+}
+function triggerPanic() {
+    const url = getSetting("panicUrl", "https://classroom.google.com");
+    try {
+        tabs.forEach(t => { try { t.frame.go("about:blank"); } catch {} });
+    } catch {}
+    window.location.href = url;
+}
+function bindPanicKey() {
+    document.removeEventListener("keydown", panicHandler);
+    document.addEventListener("keydown", panicHandler);
+}
+function panicHandler(e) {
+    const key = getSetting("panicKey", "`");
+    if (e.key === key && !e.ctrlKey && !e.metaKey && document.activeElement?.tagName !== "INPUT") {
+        e.preventDefault();
+        triggerPanic();
+    }
+}
+function bindGlobalShortcuts() {
+    document.removeEventListener("keydown", shortcutHandler);
+    document.addEventListener("keydown", shortcutHandler);
+}
+function shortcutHandler(e) {
+    const inInput = document.activeElement && (document.activeElement.tagName === "INPUT" || document.activeElement.tagName === "TEXTAREA");
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "t") { e.preventDefault(); createTab(true); }
+    else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "l") { e.preventDefault(); document.getElementById("address-bar")?.focus(); document.getElementById("address-bar")?.select(); }
+    else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "r" && !inInput) { e.preventDefault(); getActiveTab()?.frame.reload(); }
+    else if (e.altKey && e.key === "ArrowLeft") { e.preventDefault(); getActiveTab()?.frame.back(); }
+    else if (e.altKey && e.key === "ArrowRight") { e.preventDefault(); getActiveTab()?.frame.forward(); }
+    else if (e.key === "Escape") {
+        document.getElementById('history-modal')?.classList.add('hidden');
+        document.getElementById('wisp-settings-modal')?.classList.add('hidden');
+    }
+}
+
+// Push current prefs to the service worker (adblock, transport, servers).
+function syncSwConfig() {
+    const msg = {
+        type: "config",
+        wispurl: localStorage.getItem("proxServer") || DEFAULT_WISP,
+        servers: getAllWispServers(),
+        autoswitch: localStorage.getItem('wispAutoswitch') !== 'false',
+        adblock: getSetting("adblock", true),
+        transport: getSetting("transport", "auto"),
+    };
+    navigator.serviceWorker.controller?.postMessage(msg);
 }
 
 // =====================================================
 // TAB MANAGEMENT
 // =====================================================
 function createTab(makeActive = true) {
+    if (!sharedScramjet) {
+        console.error("createTab called before Scramjet initialized");
+        return null;
+    }
     const frame = sharedScramjet.createFrame();
     const tab = {
         id: nextTabId++,
@@ -288,7 +754,7 @@ function createTab(makeActive = true) {
         loadStartTime: null
     };
 
-    frame.frame.src = "NT.html";
+    frame.frame.src = getBasePath() + "NT.html";
 
     frame.addEventListener("urlchange", (e) => {
         tab.url = e.url;
@@ -333,21 +799,40 @@ function createTab(makeActive = true) {
             if (title) tab.title = title;
         } catch { }
 
-        if (frame.frame.contentWindow.location.href.includes('NT.html')) {
-            tab.title = "New Tab";
-            tab.url = "";
-            tab.favicon = null;
+        try {
+            if (frame.frame.contentWindow.location.href.includes('NT.html')) {
+                tab.title = "New Tab";
+                tab.url = "";
+                tab.favicon = null;
+            }
+        } catch {}
+
+        // Successful load: history + positive traffic signal + session.
+        if (tab.url && !tab.url.includes("NT.html") && tab.url !== "about:blank") {
+            recordHistory(tab.url, tab.title);
+            const ms = tab.loadStartTime ? Date.now() - tab.loadStartTime : 800;
+            recordFetchResult(localStorage.getItem("proxServer") || DEFAULT_WISP, true, ms);
+            if (tab.id === activeTabId) updateConnectionStatus("online", ms < 15000 ? Math.round(ms) : null);
         }
 
         updateTabsUI();
         updateAddressBar();
         updateLoadingBar(tab, 100);
+        saveSession();
     });
 
     tabs.push(tab);
     document.getElementById("iframe-container").appendChild(frame.frame);
     if (makeActive) switchTab(tab.id);
+    else { updateTabsUI(); saveSession(); }
     return tab;
+}
+
+function duplicateTab(tabId) {
+    const src = tabs.find(t => t.id === tabId);
+    if (!src) return;
+    const t = createTab(true);
+    if (t && src.url && !src.url.includes("NT.html")) handleSubmit(src.url);
 }
 
 function showIframeLoading(show, url = '') {
@@ -382,6 +867,7 @@ function switchTab(tabId) {
 
     updateTabsUI();
     updateAddressBar();
+    saveSession();
 }
 
 function closeTab(tabId) {
@@ -404,10 +890,18 @@ function closeTab(tabId) {
     } else {
         updateTabsUI();
     }
+    saveSession();
+}
+
+function escapeHtml(s) {
+    return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
 }
 
 function updateTabsUI() {
     const container = document.getElementById("tabs-container");
+    if (!container) return;
     container.innerHTML = "";
 
     tabs.forEach(tab => {
@@ -417,11 +911,14 @@ function updateTabsUI() {
         const iconHtml = tab.loading 
             ? `<div class="tab-spinner"></div>`
             : tab.favicon 
-                ? `<img src="${tab.favicon}" class="tab-favicon" onerror="this.style.display='none'">`
+                ? `<img src="${escapeHtml(tab.favicon)}" class="tab-favicon" onerror="this.style.display='none'">`
                 : '';
 
-        el.innerHTML = `${iconHtml}<span class="tab-title">${tab.title}</span><span class="tab-close">&times;</span>`;
+        el.innerHTML = `${iconHtml}<span class="tab-title"></span><span class="tab-close">&times;</span>`;
+        el.querySelector(".tab-title").textContent = tab.title || "New Tab";
+        el.title = `${tab.title || "New Tab"}\n${tab.url || ""}\n(double-click to duplicate)`;
         el.onclick = () => switchTab(tab.id);
+        el.ondblclick = (e) => { e.stopPropagation(); duplicateTab(tab.id); };
         el.querySelector(".tab-close").onclick = (e) => { e.stopPropagation(); closeTab(tab.id); };
         container.appendChild(el);
     });
@@ -437,25 +934,56 @@ function updateAddressBar() {
     const bar = document.getElementById("address-bar");
     const tab = getActiveTab();
     if (bar && tab) {
-        bar.value = (tab.url && !tab.url.includes("NT.html")) ? tab.url : "";
+        bar.value = (tab.url && !tab.url.includes("NT.html") && tab.url !== "about:blank") ? tab.url : "";
+    }
+    const star = document.getElementById("bookmark-star");
+    if (star && tab) {
+        const marked = !!(tab.url && getBookmarks().some(m => m.url === tab.url));
+        star.innerHTML = `<i class="fa-${marked ? "solid" : "regular"} fa-star"></i>`;
+        star.classList.toggle("starred", marked);
     }
 }
 
 function handleSubmit(url) {
     const tab = getActiveTab();
-    let input = url ?? document.getElementById("address-bar").value.trim();
+    if (!tab) return;
+    let input = (url ?? document.getElementById("address-bar").value).trim();
     if (!input) return;
 
-    if (!input.startsWith('http')) {
-        input = input.includes('.') && !input.includes(' ') 
+    if (!/^https?:\/\//i.test(input)) {
+        input = input.includes('.') && !input.includes(' ')
             ? `https://${input}`
-            : `https://search.brave.com/search?q=${encodeURIComponent(input)}`;
+            : `${getSearchEngine().url}${encodeURIComponent(input)}`;
     }
-    
+    // Strip tracking params before proxying
+    try {
+        const u = new URL(input);
+        ["utm_source","utm_medium","utm_campaign","utm_term","utm_content","fbclid","gclid","msclkid","mc_cid","mc_eid"].forEach(p => u.searchParams.delete(p));
+        input = u.toString();
+    } catch {}
+
     tab.loading = true;
+    tab.loadStartTime = Date.now();
+    showErrorBox(false);
     showIframeLoading(true, input);
     updateLoadingBar(tab, 10);
-    tab.frame.go(input);
+    updateConnectionStatus("switching", null);
+    const t0 = Date.now();
+    try {
+        tab.frame.go(input);
+        recordHistory(input, input);
+        // Optimistic latency sample; real fetch timing happens in SW.
+        setTimeout(() => {
+            const st = transportStats.get(localStorage.getItem("proxServer"));
+            updateConnectionStatus("online", st?.emaMs != null ? Math.round(st.emaMs) : null);
+        }, 1500);
+    } catch (err) {
+        tab.loading = false;
+        showIframeLoading(false);
+        showErrorBox(true, String(err?.message || err));
+        recordFetchResult(localStorage.getItem("proxServer") || DEFAULT_WISP, false, Date.now() - t0);
+    }
+    saveSession();
 }
 
 function updateLoadingBar(tab, percent) {
@@ -494,55 +1022,150 @@ function renderServerList() {
         const item = document.createElement('div');
         item.className = `wisp-option ${isActive ? 'active' : ''}`;
 
-        const deleteBtn = isCustom
-            ? `<button class="delete-wisp-btn" onclick="event.stopPropagation(); deleteCustomWisp('${server.url}')"><i class="fa-solid fa-trash"></i></button>`
-            : '';
-
         item.innerHTML = `
             <div class="wisp-option-header">
-                <div class="wisp-option-name">
-                    ${server.name}
-                    ${isActive ? '<i class="fa-solid fa-check" style="margin-left:8px; font-size: 0.7em; color: var(--accent);"></i>' : ''}
-                </div>
+                <div class="wisp-option-name"></div>
                 <div class="server-status">
                     <span class="ping-text">...</span>
                     <div class="status-indicator"></div>
-                    ${deleteBtn}
                 </div>
             </div>
-            <div class="wisp-option-url">${server.url}</div>
+            <div class="wisp-option-url"></div>
         `;
+        item.querySelector('.wisp-option-name').textContent = server.name;
+        if (isActive) {
+            item.querySelector('.wisp-option-name').insertAdjacentHTML('beforeend', '<i class="fa-solid fa-check" style="margin-left:8px; font-size: 0.7em; color: var(--accent);"></i>');
+        }
+        item.querySelector('.wisp-option-url').textContent = server.url;
+        if (isCustom) {
+            const del = document.createElement('button');
+            del.className = 'delete-wisp-btn';
+            del.innerHTML = '<i class="fa-solid fa-trash"></i>';
+            del.onclick = (e) => { e.stopPropagation(); window.deleteCustomWisp(server.url); };
+            item.querySelector('.server-status').appendChild(del);
+        }
 
         item.onclick = () => setWisp(server.url);
         list.appendChild(item);
         checkServerHealth(server.url, item);
     });
 
-    // Add Autoswitch Toggle
-    const isAutoswitch = localStorage.getItem('wispAutoswitch') !== 'false';
+    // Add Autoswitch Toggle (read live state on each click — no stale closure)
     const toggleContainer = document.createElement('div');
     toggleContainer.className = 'wisp-option';
     toggleContainer.style.cssText = 'margin-top: 10px; cursor: default;';
-    toggleContainer.innerHTML = `
-        <div class="wisp-option-header" style="justify-content: space-between;">
-            <div class="wisp-option-name"><i class="fa-solid fa-rotate" style="margin-right:8px"></i> Auto-switch on failure</div>
-            <div class="toggle-switch ${isAutoswitch ? 'active' : ''}" id="autoswitch-toggle">
-                <div class="toggle-knob"></div>
+    const paintToggle = () => {
+        const on = localStorage.getItem('wispAutoswitch') !== 'false';
+        toggleContainer.innerHTML = `
+            <div class="wisp-option-header" style="justify-content: space-between;">
+                <div class="wisp-option-name"><i class="fa-solid fa-rotate" style="margin-right:8px"></i> Auto-switch on failure</div>
+                <div class="toggle-switch ${on ? 'active' : ''}" id="autoswitch-toggle">
+                    <div class="toggle-knob"></div>
+                </div>
             </div>
-        </div>
-    `;
+        `;
+    };
+    paintToggle();
 
     toggleContainer.onclick = () => {
-        const newState = !isAutoswitch;
-        localStorage.setItem('wispAutoswitch', newState);
-        document.getElementById('autoswitch-toggle').classList.toggle('active', newState);
+        const currentlyOn = localStorage.getItem('wispAutoswitch') !== 'false';
+        const newState = !currentlyOn;
+        localStorage.setItem('wispAutoswitch', String(newState));
+        paintToggle();
 
-        navigator.serviceWorker.controller?.postMessage({ type: 'config', autoswitch: newState });
+        syncSwConfig();
         notify('success', 'Settings Saved', `Autoswitch ${newState ? 'Enabled' : 'Disabled'}`);
-        location.reload();
     };
 
     list.appendChild(toggleContainer);
+
+    // ---- Advanced section: transport / search / privacy / cloak / safety ----
+    const adv = document.createElement('div');
+    adv.className = 'settings-adv';
+    const transport = getSetting("transport", "auto");
+    const engine = getSetting("searchEngine", "brave");
+    const adblock = getSetting("adblock", true);
+    const cloak = getSetting("cloak", "ixl");
+    const panicKey = getSetting("panicKey", "`");
+    const panicUrl = getSetting("panicUrl", "https://classroom.google.com");
+    const accent = getSetting("accent", "#ffffff");
+    const restore = getSetting("restoreSession", true);
+    adv.innerHTML = `
+        <div class="section-title" style="margin-top:16px">Transport (advanced)</div>
+        <select id="transport-select" class="settings-select">
+            <option value="auto">Auto (epoxy → libcurl fallback)</option>
+            <option value="epoxy-jsdelivr">Epoxy (jsDelivr)</option>
+            <option value="epoxy-unpkg">Epoxy (unpkg)</option>
+            <option value="libcurl">Libcurl</option>
+        </select>
+        <div class="settings-hint">Auto tries Epoxy CDNs first, then Libcurl — different TLS stacks unblock different sites.</div>
+        <div class="section-title" style="margin-top:16px">Search engine</div>
+        <select id="engine-select" class="settings-select"></select>
+        <div class="section-title" style="margin-top:16px">Privacy</div>
+        <div class="wisp-option" id="adblock-row" style="cursor:default"><div class="wisp-option-header" style="justify-content:space-between"><div class="wisp-option-name">Block ads + trackers</div><div class="toggle-switch ${adblock ? "active" : ""}" id="adblock-toggle"><div class="toggle-knob"></div></div></div></div>
+        <div class="wisp-option" id="restore-row" style="cursor:default;margin-top:6px"><div class="wisp-option-header" style="justify-content:space-between"><div class="wisp-option-name">Restore tabs on restart</div><div class="toggle-switch ${restore ? "active" : ""}" id="restore-toggle"><div class="toggle-knob"></div></div></div></div>
+        <div class="settings-hint">Tracking params (utm_*, fbclid, gclid…) are always stripped before proxying.</div>
+        <div class="section-title" style="margin-top:16px">Tab cloak</div>
+        <select id="cloak-select" class="settings-select"></select>
+        <div class="section-title" style="margin-top:16px">Panic key</div>
+        <div class="custom-input-group"><input id="panic-key" maxlength="1" value="${escapeHtml(panicKey)}"><input id="panic-url" value="${escapeHtml(panicUrl)}"></div>
+        <div class="settings-hint">Press the panic key to instantly jump to the panic URL. Right-click a bookmark to delete it.</div>
+        <div class="section-title" style="margin-top:16px">Accent</div>
+        <div class="swatches" id="accent-swatches"></div>
+    `;
+    list.appendChild(adv);
+
+    const tSel = adv.querySelector("#transport-select");
+    tSel.value = transport;
+    tSel.onchange = async () => {
+        setSetting("transport", tSel.value);
+        syncSwConfig();
+        updateConnectionStatus("switching", null);
+        await reconnectTransport(localStorage.getItem("proxServer") || DEFAULT_WISP);
+        updateConnectionStatus("online", null);
+        notify("success", "Transport updated", tSel.value);
+    };
+    const eSel = adv.querySelector("#engine-select");
+    Object.entries(SEARCH_ENGINES).forEach(([id, e]) => {
+        const o = document.createElement("option");
+        o.value = id; o.textContent = e.name;
+        eSel.appendChild(o);
+    });
+    eSel.value = engine;
+    eSel.onchange = () => { setSetting("searchEngine", eSel.value); notify("success", "Search engine", SEARCH_ENGINES[eSel.value].name); };
+    adv.querySelector("#adblock-row").onclick = () => {
+        const v = !getSetting("adblock", true);
+        setSetting("adblock", v);
+        adv.querySelector("#adblock-toggle").classList.toggle("active", v);
+        syncSwConfig();
+    };
+    adv.querySelector("#restore-row").onclick = () => {
+        const v = !getSetting("restoreSession", true);
+        setSetting("restoreSession", v);
+        adv.querySelector("#restore-toggle").classList.toggle("active", v);
+    };
+    const cSel = adv.querySelector("#cloak-select");
+    Object.entries(CLOAK_PRESETS).forEach(([id, p]) => {
+        const o = document.createElement("option");
+        o.value = id; o.textContent = p.name;
+        cSel.appendChild(o);
+    });
+    cSel.value = cloak;
+    cSel.onchange = () => { setSetting("cloak", cSel.value); applyCloak(); };
+    adv.querySelector("#panic-key").onchange = (e) => setSetting("panicKey", e.target.value || "`");
+    adv.querySelector("#panic-url").onchange = (e) => {
+        let u = e.target.value.trim() || "https://classroom.google.com";
+        if (!/^https?:\/\//i.test(u)) u = "https://" + u;
+        setSetting("panicUrl", u); e.target.value = u;
+    };
+    const sw = adv.querySelector("#accent-swatches");
+    ["#ffffff", "#3b82f6", "#22c55e", "#a855f7", "#ef4444", "#f59e0b"].forEach(c => {
+        const b = document.createElement("button");
+        b.className = "swatch" + (c === accent ? " sel" : "");
+        b.style.background = c;
+        b.onclick = () => { setSetting("accent", c); applyTheme(); sw.querySelectorAll(".swatch").forEach(x => x.classList.remove("sel")); b.classList.add("sel"); };
+        sw.appendChild(b);
+    });
 }
 
 function saveCustomWisp() {
@@ -588,47 +1211,37 @@ async function checkServerHealth(url, element) {
     const dot = element.querySelector('.status-indicator');
     const text = element.querySelector('.ping-text');
     const start = Date.now();
+    let settled = false;
 
+    const markOnline = (latency) => {
+        if (settled) return;
+        settled = true;
+        dot.classList.add('status-success');
+        text.textContent = `${latency}ms`;
+    };
     const markOffline = () => {
+        if (settled) return;
+        settled = true;
         dot.classList.add('status-error');
         text.textContent = "Offline";
     };
 
+    // WISP is a raw WebSocket protocol — an HTTP HEAD to /health is meaningless
+    // (no-cors always resolves opaque). Just do a real WebSocket open test.
     try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 2000);
-        
-        await fetch(url.replace('wss://', 'https://').replace('/wisp/', '/health') || url, {
-            method: 'HEAD',
-            signal: controller.signal,
-            mode: 'no-cors'
-        });
-        
-        clearTimeout(timeout);
-        dot.classList.add('status-success');
-        text.textContent = `${Date.now() - start}ms`;
-    } catch {
-        // Fallback: quick WebSocket test
-        try {
-            const wsTest = new WebSocket(url);
-            wsTest.onopen = () => {
-                dot.classList.add('status-success');
-                text.textContent = `${Date.now() - start}ms`;
-                wsTest.close();
-            };
-            wsTest.onerror = markOffline;
-            
-            setTimeout(() => {
-                if (wsTest.readyState !== WebSocket.OPEN) {
-                    wsTest.close();
-                    markOffline();
-                }
-            }, 1000);
-        } catch { markOffline(); }
-    }
+        const ws = new WebSocket(url);
+        const timer = setTimeout(() => { try { ws.close(); } catch {} markOffline(); }, 2500);
+        ws.onopen = () => {
+            clearTimeout(timer);
+            const latency = Date.now() - start;
+            try { ws.close(); } catch {}
+            markOnline(latency);
+        };
+        ws.onerror = () => { clearTimeout(timer); try { ws.close(); } catch {} markOffline(); };
+    } catch { markOffline(); }
 }
 
-function setWisp(url) {
+async function setWisp(url) {
     const oldUrl = localStorage.getItem('proxServer');
     localStorage.setItem('proxServer', url);
 
@@ -637,8 +1250,20 @@ function setWisp(url) {
         notify('success', 'Proxy Changed', `Switching to ${serverName}...`);
     }
 
-    navigator.serviceWorker.controller?.postMessage({ type: 'config', wispurl: url });
-    setTimeout(() => location.reload(), 600);
+    // Try live reconnect first — no reload needed in most cases.
+    updateConnectionStatus("switching", null);
+    const ok = await reconnectTransport(url);
+    syncSwConfig();
+    if (ok) {
+        renderServerList();
+        const st = transportStats.get(url);
+        updateConnectionStatus("online", st?.emaMs != null ? Math.round(st.emaMs) : null);
+        // Reload active tab through the new server so the switch takes effect.
+        const t = getActiveTab();
+        if (t && t.url && !t.url.includes("NT.html")) handleSubmit(t.url);
+    } else {
+        setTimeout(() => location.reload(), 600);
+    }
 }
 
 // =====================================================
@@ -670,6 +1295,9 @@ async function checkHashParameters() {
 // =====================================================
 document.addEventListener('DOMContentLoaded', async function () {
     try {
+        if (typeof $scramjetLoadController !== "function") {
+            throw new Error("Scramjet CDN failed to load ($scramjetLoadController missing).");
+        }
         // Proactively find the best server before initializing
         await initializeWithBestServer();
         
@@ -678,27 +1306,26 @@ document.addEventListener('DOMContentLoaded', async function () {
 
         if ('serviceWorker' in navigator) {
             const reg = await navigator.serviceWorker.register(getBasePath() + 'sw.js', { scope: getBasePath() });
-            
+
             // Wait for SW to be ready
             await navigator.serviceWorker.ready;
-            
-            const wispUrl = localStorage.getItem("proxServer") ?? DEFAULT_WISP;
-            const allServers = getAllWispServers();
-            const autoswitch = localStorage.getItem('wispAutoswitch') !== 'false';
-            
-            const swConfig = {
+
+            const buildSwConfig = () => ({
                 type: "config",
-                wispurl: wispUrl,
-                servers: allServers,
-                autoswitch: autoswitch
-            };
+                wispurl: localStorage.getItem("proxServer") ?? DEFAULT_WISP,
+                servers: getAllWispServers(),
+                autoswitch: localStorage.getItem('wispAutoswitch') !== 'false',
+                adblock: getSetting("adblock", true),
+                transport: getSetting("transport", "auto"),
+            });
 
             // Send config to SW
             const sendConfig = async () => {
                 const sw = reg.active || navigator.serviceWorker.controller;
                 if (sw) {
-                    console.log("Sending config to SW:", swConfig);
-                    sw.postMessage(swConfig);
+                    const cfg = buildSwConfig();
+                    console.log("Sending config to SW:", cfg);
+                    sw.postMessage(cfg);
                 }
             };
 
@@ -708,14 +1335,30 @@ document.addEventListener('DOMContentLoaded', async function () {
             setTimeout(sendConfig, 1500);
 
             navigator.serviceWorker.addEventListener('message', (event) => {
-                const { type, url, name, message } = event.data;
+                const { type, url, name, message, wispUrl, ok, latency } = event.data || {};
                 if (type === 'wispChanged') {
                     console.log("SW reported Wisp Change:", event.data);
                     localStorage.setItem("proxServer", url);
+                    reconnectTransport(url);
                     notify('info', 'Autoswitched Proxy', `Now using ${name} because the previous server was slow or offline.`);
                 } else if (type === 'wispError') {
                     console.error("SW reported Wisp Error:", event.data);
+                    updateConnectionStatus("offline", null);
                     notify('error', 'Proxy Error', message);
+                } else if (type === 'fetchStats') {
+                    // Real-traffic signal from the SW: feed latency-aware routing.
+                    if (wispUrl) {
+                        recordFetchResult(wispUrl, !!ok, typeof latency === "number" ? latency : 800);
+                        if (ok && document.getElementById("conn-status")) {
+                            const st = transportStats.get(wispUrl);
+                            updateConnectionStatus("online", st?.emaMs != null ? Math.round(st.emaMs) : null);
+                        }
+                    }
+                } else if (type === 'pingResult') {
+                    if (event.data?.url && typeof event.data?.latency === "number") {
+                        const st = transportStats.get(event.data.url);
+                        if (st && st.emaMs === null) st.emaMs = event.data.latency;
+                    }
                 }
             });
 
@@ -725,5 +1368,13 @@ document.addEventListener('DOMContentLoaded', async function () {
         await initializeBrowser();
     } catch (err) {
         console.error("Initialization error:", err);
+        const loader = document.getElementById("loading");
+        if (loader) loader.style.display = "none";
+        const errBox = document.getElementById("error");
+        const errMsg = document.getElementById("error-message");
+        if (errBox) {
+            errBox.style.display = "flex";
+            if (errMsg) errMsg.textContent = String(err?.message || err);
+        }
     }
 });
