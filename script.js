@@ -1306,19 +1306,31 @@ async function checkServerHealth(url, element) {
         text.textContent = "Offline";
     };
 
-    // WISP is a raw WebSocket protocol — an HTTP HEAD to /health is meaningless
-    // (no-cors always resolves opaque). Just do a real WebSocket open test.
-    try {
-        const ws = new WebSocket(url);
-        const timer = setTimeout(() => { try { ws.close(); } catch {} markOffline(); }, 2500);
-        ws.onopen = () => {
-            clearTimeout(timer);
-            const latency = Date.now() - start;
-            try { ws.close(); } catch {}
-            markOnline(latency);
-        };
-        ws.onerror = () => { clearTimeout(timer); try { ws.close(); } catch {} markOffline(); };
-    } catch { markOffline(); }
+    // WISP is a raw WebSocket protocol. Retry once so a transient handshake
+    // failure does not make every server look offline in the settings panel.
+    const check = (attempt) => {
+        try {
+            const ws = new WebSocket(url);
+            const timer = setTimeout(() => {
+                try { ws.close(); } catch {}
+                if (attempt === 0) check(1); else markOffline();
+            }, 2500);
+            ws.onopen = () => {
+                clearTimeout(timer);
+                const latency = Date.now() - start;
+                try { ws.close(); } catch {}
+                markOnline(latency);
+            };
+            ws.onerror = () => {
+                clearTimeout(timer);
+                try { ws.close(); } catch {}
+                if (attempt === 0) check(1); else markOffline();
+            };
+        } catch {
+            if (attempt === 0) check(1); else markOffline();
+        }
+    };
+    check(0);
 }
 
 async function setWisp(url) {

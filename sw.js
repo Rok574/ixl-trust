@@ -171,6 +171,7 @@ function reportStats(wispUrl, ok, latency) {
 // Server health tracking for autoswitching
 let serverHealth = new Map();
 let currentServerStartTime = null;
+let proactiveCheckInFlight = false;
 const MAX_CONSECUTIVE_FAILURES = 2;
 const PING_TIMEOUT = 3000;
 
@@ -207,7 +208,8 @@ async function pingServer(url) {
     }
 }
 
-// Update server health status
+// Update server health status from actual proxied traffic. Probe failures are
+// only hints and must not make a working server look broken.
 function updateServerHealth(url, success) {
     const health = serverHealth.get(url) || { consecutiveFailures: 0, successes: 0, lastSuccess: 0 };
     
@@ -249,27 +251,29 @@ function switchToServer(url, latency = null) {
 // Proactively check server health and switch if needed
 async function proactiveServerCheck() {
     if (!wispConfig.autoswitch || !wispConfig.servers || wispConfig.servers.length === 0) return;
+    if (proactiveCheckInFlight) return;
+    proactiveCheckInFlight = true;
 
-    const currentUrl = wispConfig.wispurl;
-    
-    // Ping all servers to get current health status
-    const results = await Promise.all(
-        wispConfig.servers.map(s => pingServer(s.url))
-    );
+    try {
+        const currentUrl = wispConfig.wispurl;
 
-    // Update health tracking
-    results.forEach(r => updateServerHealth(r.url, r.success));
+        // Probes are only candidates; actual proxied failures decide whether
+        // the current server should be abandoned.
+        const results = await Promise.all(
+            wispConfig.servers.map(s => pingServer(s.url))
+        );
+        const currentHealth = serverHealth.get(currentUrl);
+        if (currentHealth && currentHealth.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            const bestWorking = results
+                .filter(r => r.success && r.url !== currentUrl)
+                .sort((a, b) => a.latency - b.latency)[0];
 
-    // If current server is bad and we have a better option, switch
-    const currentHealth = serverHealth.get(currentUrl);
-    if (currentHealth && currentHealth.consecutiveFailures > 0) {
-        const bestWorking = results
-            .filter(r => r.success && r.url !== currentUrl)
-            .sort((a, b) => a.latency - b.latency)[0];
-
-        if (bestWorking) {
-            switchToServer(bestWorking.url, bestWorking.latency);
+            if (bestWorking) {
+                switchToServer(bestWorking.url, bestWorking.latency);
+            }
         }
+    } finally {
+        proactiveCheckInFlight = false;
     }
 }
 
@@ -375,9 +379,18 @@ scramjet.addEventListener("request", async (e) => {
         let lastErr;
         const t0 = Date.now();
 
+        const fetchFromBare = typeof bare.fetch === "function" ? bare.fetch.bind(bare) : null;
+        if (!fetchFromBare) {
+            const unavailable = new Error("BareClient fetch unavailable");
+            updateServerHealth(wispConfig.wispurl, false);
+            reportStats(wispConfig.wispurl, false, Date.now() - t0);
+            console.error("Scramjet Fetch Error:", unavailable);
+            return new Response("Scramjet Fetch Error: " + unavailable.message, { status: 502 });
+        }
+
         for (let i = 0; i <= MAX_RETRIES; i++) {
             try {
-                const res = await bare.fetch(cleanUrl, {
+                const res = await fetchFromBare(cleanUrl, {
                     method: e.method,
                     body: e.body,
                     headers: e.requestHeaders,

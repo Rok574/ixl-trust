@@ -33,12 +33,14 @@
       letter-spacing: -2px;
       margin-bottom: 8px;
       color: #ffffff;
+      text-shadow: 0 2px 18px rgba(0, 0, 0, 0.45);
     }
 
     .date {
       font-size: 14px;
       color: #71717a;
       margin-bottom: 32px;
+      text-shadow: 0 1px 10px rgba(0, 0, 0, 0.4);
     }
 
     .search-box {
@@ -257,6 +259,7 @@
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+      text-shadow: 0 1px 8px rgba(0, 0, 0, 0.5);
     }
 
     .shortcut:hover .shortcut-label {
@@ -295,6 +298,7 @@
       color: #52525b;
       max-width: 400px;
       text-align: center;
+      text-shadow: 0 1px 8px rgba(0, 0, 0, 0.5);
     }
 
     .loader {
@@ -343,6 +347,7 @@
       <label class="color-control">Background color<input id="backgroundColor" type="color" value="#0a0a0a" title="Change background color"></label>
       <button id="backgroundImage" type="button" title="Set a background image"><i class="fa-regular fa-image"></i><span>Image</span></button>
       <button id="resetBackground" type="button" title="Reset the background"><i class="fa-solid fa-rotate-left"></i><span>Reset</span></button>
+      <input id="backgroundFile" type="file" accept="image/*" hidden>
     </div>
   </div>
 
@@ -438,6 +443,7 @@ setInterval(updateClock, 1000);
 
     // New-tab appearance
     const backgroundColor = $('#backgroundColor');
+    const backgroundFile = $('#backgroundFile');
     const savedBackgroundColor = localStorage.getItem('newTabBackgroundColor') || '#0a0a0a';
     const savedBackgroundImage = localStorage.getItem('newTabBackgroundImage') || '';
     backgroundColor.value = savedBackgroundColor;
@@ -451,17 +457,27 @@ setInterval(updateClock, 1000);
       localStorage.setItem('newTabBackgroundColor', backgroundColor.value);
       document.body.style.backgroundColor = backgroundColor.value;
     };
-    $('#backgroundImage').onclick = () => {
-      const image = prompt('Image URL (leave blank to remove):', localStorage.getItem('newTabBackgroundImage') || '');
-      if (image === null) return;
-      const trimmed = image.trim();
-      if (trimmed && !/^https?:\/\//i.test(trimmed) && !/^data:image\//i.test(trimmed)) {
-        alert('Use an http(s) image URL.');
+    $('#backgroundImage').onclick = () => backgroundFile.click();
+    backgroundFile.onchange = () => {
+      const file = backgroundFile.files?.[0];
+      if (!file) return;
+      if (!file.type.startsWith('image/')) {
+        alert('Please choose an image file.');
+        backgroundFile.value = '';
         return;
       }
-      if (trimmed) localStorage.setItem('newTabBackgroundImage', trimmed);
-      else localStorage.removeItem('newTabBackgroundImage');
-      applyBackgroundImage(trimmed);
+      const reader = new FileReader();
+      reader.onload = () => {
+        const image = String(reader.result || '');
+        try {
+          localStorage.setItem('newTabBackgroundImage', image);
+          applyBackgroundImage(image);
+        } catch {
+          alert('That image is too large to save. Please choose a smaller image.');
+        }
+        backgroundFile.value = '';
+      };
+      reader.readAsDataURL(file);
     };
     $('#resetBackground').onclick = () => {
       localStorage.removeItem('newTabBackgroundColor');
